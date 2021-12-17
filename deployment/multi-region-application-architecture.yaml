@@ -1,0 +1,443 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Multi-Region Application Architecture
+#
+# template for multi-region-application-architecture
+# **DO NOT DELETE**
+#
+# author: aws-solutions-builder@
+
+AWSTemplateFormatVersion: 2010-09-09
+
+Description: (SO0085) - This template deploys the Multi Region Application Architecture to the current region and a specified secondary region using CloudFormation StackSets. (Version SOLUTION_VERSION_PLACEHOLDER)
+
+Parameters:
+  SecondaryRegion:
+    Type: String
+    AllowedPattern: ^[\w-]+$
+
+Mappings:
+  SourceCode:
+    General:
+      S3Bucket: CODE_BUCKET_PLACEHOLDER
+      KeyPrefix: SOLUTION_NAME_PLACEHOLDER/SOLUTION_VERSION_PLACEHOLDER
+  Solution:
+    Metrics:
+      SendAnonymousData: "Yes"
+
+Resources:
+  StackNameFormatterLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: "stack-name-formatter/index.handler"
+      Role: !GetAtt StackNameFormatterRole.Arn
+      Code:
+        S3Bucket: !Join ["-", [!FindInMap ["SourceCode", "General", "S3Bucket"], Ref: "AWS::Region"]]
+        S3Key: !Join ["/", [!FindInMap ["SourceCode", "General", "KeyPrefix"],  "stack-name-formatter.zip"]]
+      Runtime:  nodejs12.x
+      Timeout: 30
+      Environment:
+        Variables:
+          SEND_METRICS: !FindInMap ["Solution", "Metrics", "SendAnonymousData"]
+          SOLUTION_ID: SO0085
+          UUID: !GetAtt UuidGenerator.SOLUTION_UUID
+          VERSION: SOLUTION_VERSION_PLACEHOLDER
+          PRIMARY_REGION: !Ref AWS::Region
+          SECONDARY_REGION: !Ref SecondaryRegion
+
+  StackNameFormatterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub ${AWS::StackName}-StackNameFormatterRole
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/*
+
+  # The CfnExecRole allows CloudFormation to provision Stack Resources in each region specified
+  CfnExecRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: >- 
+              sns:* - CloudFormation StackSets requires * resource
+              cloudformation:* - CloudFormation StackSets requires * resource
+              dynamodb:DescribeLimits - Requires * as a resource
+          - id: F3
+            reason: >- 
+              cloudformation:*, sns:* - The CfnExec role will be assumed by CloudFormation as it provisions StackSet resources. Permissions to CloudFormation and SNS are needed to perform actions and report status
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS:
+                - !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action:
+              - sts:AssumeRole
+      Policies:
+        # The Base Policy that all CfnExecRole must have to allow it to take CloudFormation actions and communicate status
+        - PolicyName: !Sub ${AWS::StackName}-BaseCfnExecutionRole
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:*
+                Resource:
+                  - '*'
+              - Effect: Allow
+                Action:
+                  - cloudformation:*
+                Resource:
+                  - '*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource:
+                  # Allow the StackSet to get nested templates and lambda packages for this solution's s3 bucket/prefix
+                  - !Join ["", ["arn:aws:s3:::", !FindInMap ["SourceCode", "General", "S3Bucket"], "-", Ref: "AWS::Region", "/", !FindInMap ["SourceCode", "General", "KeyPrefix"], "/*"]]
+                  - !Join ["", ["arn:aws:s3:::", !FindInMap ["SourceCode", "General", "S3Bucket"], "-", Ref: "SecondaryRegion", "/", !FindInMap ["SourceCode", "General", "KeyPrefix"], "/*"]]
+              - Effect: Allow
+                Action:
+                  - lambda:CreateFunction
+                  - lambda:DeleteFunction
+                  - lambda:InvokeFunction
+                  - lambda:GetFunction
+                  - lambda:GetFunctionConfiguration
+                  - lambda:AddPermission
+                  - lambda:RemovePermission
+                Resource:
+                  - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:StackSet-${StackNameFormatter.Value}* 
+                  - !Sub arn:aws:lambda:${SecondaryRegion}:${AWS::AccountId}:function:StackSet-${StackNameFormatter.Value}* 
+              - Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:GetRolePolicy
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:GetRole
+                  - iam:PassRole
+                Resource:
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/StackSet-${StackNameFormatter.Value}* 
+        - PolicyName: !Sub ${AWS::StackName}-PhotosApiPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - apigateway:GET
+                  - apigateway:DELETE
+                  - apigateway:PATCH
+                  - apigateway:POST
+                  - apigateway:PUT
+                Resource:
+                  - !Sub arn:aws:apigateway:${AWS::Region}::/account
+                  - !Sub arn:aws:apigateway:${SecondaryRegion}::/account
+                  - !Sub arn:aws:apigateway:${AWS::Region}::/restapis/*
+                  - !Sub arn:aws:apigateway:${SecondaryRegion}::/restapis/*
+                  - !Sub arn:aws:apigateway:${AWS::Region}::/restapis
+                  - !Sub arn:aws:apigateway:${SecondaryRegion}::/restapis
+        - PolicyName: !Sub ${AWS::StackName}-KeyValueStorePolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:CreateTable
+                  - dynamodb:DeleteTable
+                  - dynamodb:DescribeTable
+                Resource:
+                  - !Sub arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${StackNameFormatter.Value}-${UuidGenerator.BUCKET_NAME_TOKEN}-key-value-store
+                  - !Sub arn:aws:dynamodb:${SecondaryRegion}:${AWS::AccountId}:table/${StackNameFormatter.Value}-${UuidGenerator.BUCKET_NAME_TOKEN}-key-value-store
+              - Effect: Allow
+                Action:
+                  - dynamodb:CreateGlobalTable
+                Resource:
+                  - !Sub arn:aws:dynamodb::${AWS::AccountId}:global-table/${StackNameFormatter.Value}-${UuidGenerator.BUCKET_NAME_TOKEN}-key-value-store
+              - Effect: Allow
+                Action:
+                  - dynamodb:DescribeLimits
+                Resource:
+                  - '*'
+              - Effect: Allow
+                Action:
+                  - iam:CreateServiceLinkedRole
+                Resource:
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/*
+        - PolicyName: !Sub ${AWS::StackName}-ObjectStorePolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:CreateBucket
+                  - s3:PutEncryptionConfiguration
+                  - s3:PutBucketVersioning
+                  - s3:PutBucketPublicAccessBlock
+                  - s3:PutBucketAcl
+                  - s3:PutBucketLogging
+                  - s3:PutReplicationConfiguration
+                  - s3:PutBucketCORS
+                Resource:
+                  - !Sub arn:aws:s3:::${StackNameFormatter.Value}-*-${AWS::Region}
+                  - !Sub arn:aws:s3:::${StackNameFormatter.Value}-*-${AWS::Region}-logs
+                  - !Sub arn:aws:s3:::${StackNameFormatter.Value}-*-${SecondaryRegion}
+                  - !Sub arn:aws:s3:::${StackNameFormatter.Value}-*-${SecondaryRegion}-logs
+        - PolicyName: !Sub ${AWS::StackName}-RoutingLayerPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:CreateTable
+                  - dynamodb:DeleteTable
+                  - dynamodb:DescribeTable
+                Resource:
+                  - !Sub arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${StackNameFormatter.Value}-${UuidGenerator.BUCKET_NAME_TOKEN}-app-config
+                  - !Sub arn:aws:dynamodb:${SecondaryRegion}:${AWS::AccountId}:table/${StackNameFormatter.Value}-${UuidGenerator.BUCKET_NAME_TOKEN}-app-config
+              - Effect: Allow
+                Action:
+                  - dynamodb:CreateGlobalTable
+                Resource:
+                  - !Sub arn:aws:dynamodb::${AWS::AccountId}:global-table/${StackNameFormatter.Value}-${UuidGenerator.BUCKET_NAME_TOKEN}-app-config
+              - Effect: Allow
+                Action:
+                  - dynamodb:DescribeLimits
+                Resource:
+                  - '*'
+              - Effect: Allow
+                Action:
+                  - iam:CreateServiceLinkedRole
+                Resource:
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/*
+
+  # The CfnAdminRole allows CloudFormation to assume the role necessary to provision Stack Resources
+  CfnAdminRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - cloudformation.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub ${AWS::StackName}-CfnAdminRole
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sts:AssumeRole
+                Resource:
+                  - !GetAtt CfnExecRole.Arn
+
+  StackNameFormatter:
+    Type: Custom::StackNameFormatter
+    Properties:
+      ServiceToken: !GetAtt StackNameFormatterLambda.Arn
+      StackName: !Sub ${AWS::StackName}
+
+  UuidGeneratorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub ${AWS::StackName}-UuidGeneratorRole
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/*
+
+  UuidGeneratorLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt UuidGeneratorRole.Arn
+      Code:
+        S3Bucket: !Join ["-", [!FindInMap ["SourceCode", "General", "S3Bucket"], Ref: "AWS::Region"]]
+        S3Key: !Join ["/", [!FindInMap ["SourceCode", "General", "KeyPrefix"],  "uuid-generator.zip"]]
+      Runtime:  nodejs12.x
+      Timeout: 30
+
+  UuidGenerator:
+    Type: Custom::UuidGenerator
+    Properties:
+      ServiceToken: !GetAtt UuidGeneratorLambda.Arn
+
+  StackSetResource:
+    Type: AWS::CloudFormation::StackSet
+    Properties:
+      AdministrationRoleARN: !GetAtt CfnAdminRole.Arn
+      Capabilities: 
+        - CAPABILITY_IAM
+      Description: StackSet for Multi-Region Application Architecture (Version SOLUTION_VERSION_PLACEHOLDER)
+      ExecutionRoleName: !Ref CfnExecRole
+      OperationPreferences:
+        RegionOrder:
+          - !Ref SecondaryRegion
+          - !Ref AWS::Region
+        FailureToleranceCount: 0
+        MaxConcurrentCount: 1
+      Parameters:
+        - ParameterKey: SecondaryRegion
+          ParameterValue: !Ref SecondaryRegion
+        - ParameterKey: ParentStackName
+          ParameterValue: !GetAtt StackNameFormatter.Value
+        - ParameterKey: BucketNameToken
+          ParameterValue: !GetAtt UuidGenerator.BUCKET_NAME_TOKEN
+        - ParameterKey: AppId
+          ParameterValue: !GetAtt UuidGenerator.APP_ID
+        - ParameterKey: SendAnonymousData
+          ParameterValue: !FindInMap [ "Solution", "Metrics", "SendAnonymousData" ]
+        - ParameterKey: SolutionUuid
+          ParameterValue: !GetAtt UuidGenerator.SOLUTION_UUID
+      PermissionModel: SELF_MANAGED
+      StackInstancesGroup:
+        - Regions:
+            - !Ref AWS::Region
+            - !Ref SecondaryRegion
+          DeploymentTargets:
+            Accounts:
+              - !Ref AWS::AccountId 
+      StackSetName: !Sub ${StackNameFormatter.Value}-${UuidGenerator.BUCKET_NAME_TOKEN}
+      TemplateURL: !Sub
+        - "https://s3.amazonaws.com/${S3Bucket}-${AWS::Region}/${KeyPrefix}/multi-region-application-architecture-stackset-instance.template"
+        - S3Bucket: !FindInMap ["SourceCode", "General", "S3Bucket"]
+          KeyPrefix: !FindInMap ["SourceCode", "General", "KeyPrefix"]
+
+  StackSetOutputConsolidatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub ${AWS::StackName}-StackSetOutputConsolidatorRole
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/*
+              - Effect: Allow
+                Action:
+                  - cloudformation:ListStackInstances
+                Resource:
+                  - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stackset/${StackSetResource}
+              - Effect: Allow
+                Action:
+                  - cloudformation:DescribeStacks
+                Resource:
+                  - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/StackSet-${StackNameFormatter.Value}-${UuidGenerator.BUCKET_NAME_TOKEN}*
+                  - !Sub arn:aws:cloudformation:${SecondaryRegion}:${AWS::AccountId}:stack/StackSet-${StackNameFormatter.Value}-${UuidGenerator.BUCKET_NAME_TOKEN}*
+
+  StackSetOutputConsolidatorLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt StackSetOutputConsolidatorRole.Arn
+      Code:
+        S3Bucket: !Join ["-", [!FindInMap ["SourceCode", "General", "S3Bucket"], Ref: "AWS::Region"]]
+        S3Key: !Join ["/", [!FindInMap ["SourceCode", "General", "KeyPrefix"],  "stackset-output-consolidator.zip"]]
+      Runtime:  nodejs12.x
+      Timeout: 30
+
+  StackSetOutputConsolidator:
+    Type: Custom::StackSetOutputConsolidator
+    Properties:
+      ServiceToken: !GetAtt StackSetOutputConsolidatorLambda.Arn
+      StackSetId: !Ref StackSetResource
+      PrimaryRegion: !Ref AWS::Region
+      SecondaryRegion: !Ref SecondaryRegion
+      AccountId: !Ref AWS::AccountId
+
+Outputs:
+  SampleApplicationAppId:
+    Value: !GetAtt UuidGenerator.APP_ID
+    Export:
+      Name: !Sub ${AWS::StackName}-SampleApplicationAppId
+  
+  AppConfigGlobalTableName:
+    Value: !Sub ${StackNameFormatter.Value}-${UuidGenerator.BUCKET_NAME_TOKEN}-app-config
+
+  PrimaryRoutingLayerApiId:
+    Value: !GetAtt StackSetOutputConsolidator.PrimaryRoutingLayerApiId
+    Export:
+      Name: !Sub ${AWS::StackName}-PrimaryRoutingLayerApiId
+
+  PrimaryPhotosApiId:
+    Value: !GetAtt StackSetOutputConsolidator.PrimaryPhotosApiId
+    Export:
+      Name: !Sub ${AWS::StackName}-PrimaryPhotosApiId
+
+  PrimaryObjectStoreBucket:
+    Value: !GetAtt StackSetOutputConsolidator.PrimaryObjectStoreBucket
+    Export:
+      Name: !Sub ${AWS::StackName}-PrimaryObjectStoreBucket
+
+  SecondaryRoutingLayerApiId:
+    Value: !GetAtt StackSetOutputConsolidator.SecondaryRoutingLayerApiId
+    Export:
+      Name: !Sub ${AWS::StackName}-SecondaryRoutingLayerApiId
+
+  SecondaryPhotosApiId:
+    Value: !GetAtt StackSetOutputConsolidator.SecondaryPhotosApiId
+    Export:
+      Name: !Sub ${AWS::StackName}-SecondaryPhotosApiId
+
+  SecondaryObjectStoreBucket:
+    Value: !GetAtt StackSetOutputConsolidator.SecondaryObjectStoreBucket
+    Export:
+      Name: !Sub ${AWS::StackName}-SecondaryObjectStoreBucket
+
+  SecondaryRegion:
+    Value: !Ref SecondaryRegion
+    Export:
+      Name: !Sub ${AWS::StackName}-SecondaryRegion
